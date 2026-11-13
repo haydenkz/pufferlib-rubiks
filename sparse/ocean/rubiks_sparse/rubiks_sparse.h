@@ -31,6 +31,8 @@ typedef unsigned char obs_t;
 #define POOL 65536
 #define ARCHIVE (1 << 20)
 #define BATCH 20000
+// How much the nudge moves after each batch (see NUDGE)
+#define NUDGE_STEP 0.02f
 
 struct Log {
     float perf;
@@ -39,6 +41,7 @@ struct Log {
     float episode_length;
     float replay_perf;
     float replay_length;
+    float nudge;
     float n;
 };
 
@@ -53,6 +56,8 @@ struct Env {
     float archive_share;
     float archive_keep;
     int nudge;
+    float nudge_target;
+    int nudge_max;
     // Whether this episode is a replay, and the cube it started from
     int replay;
     unsigned char first[54];
@@ -255,6 +260,12 @@ int REPLAY_MOVES;
 // a cube cannot be solved in fewer moves than it is from solved.
 float REPLAY_PERF;
 float REPLAY_LENGTH;
+// How many random turns a replay's start is given: one, plus up to NUDGE
+// more. It starts at `nudge` and adapts: after each batch it goes up a little
+// if more than a nudge_target share of the replays were solved and down a
+// little if fewer, between 0 and nudge_max. So the replays get harder as fast
+// as the policy can take, and easier again when it struggles.
+float NUDGE;
 // The fewest moves a random scramble has been solved in, or 0 before the
 // first such solve
 int SHORTEST_SOLVE;
@@ -269,14 +280,14 @@ void unlock_shared() {
 }
 
 // A fresh_share of episodes are uniformly random scrambles. The rest are
-// replays: a cube from the pool or the archive, given up to `nudge` more
-// random turns.
+// replays: a cube from the pool or the archive, given one random turn plus up
+// to NUDGE more.
 void puf_reset(Rubiks* env) {
     env->tick = 0;
     env->turned = -1;
-    env->replay = rand_r(&env->rng) >= env->fresh_share * RAND_MAX;
+    env->replay = rand_r(&env->rng) >= env->fresh_share * (float)RAND_MAX;
     if (env->replay) {
-        int archive = rand_r(&env->rng) < env->archive_share * RAND_MAX;
+        int archive = rand_r(&env->rng) < env->archive_share * (float)RAND_MAX;
         long slot = rand_r(&env->rng);
         lock_shared();
         if (archive && ARCHIVED > 0) {
@@ -285,9 +296,11 @@ void puf_reset(Rubiks* env) {
             slot %= POOLED < POOL ? POOLED : POOL;
             memcpy(env->stickers, POOL_CUBES[slot], 54);
         }
+        float nudge = NUDGE;
         unlock_shared();
-        // At least one turn if that leaves it solved
-        int turns = rand_r(&env->rng) % (env->nudge + 1);
+        int turns = rand_r(&env->rng);
+        turns = 1 + (int)(nudge * turns / (RAND_MAX + 1.0));
+        // And another for as long as a turn has left it solved
         for (int i = 0; i < turns || is_solved(env->stickers); i++) {
             turn(env->stickers, rand_r(&env->rng) % 18);
         }
@@ -308,7 +321,7 @@ void finish_episode(Rubiks* env, int solved) {
     int keep = 0;
     long slot = 0;
     if (solved) {
-        keep = rand_r(&env->rng) < env->archive_keep * RAND_MAX;
+        keep = rand_r(&env->rng) < env->archive_keep * (float)RAND_MAX;
         slot = rand_r(&env->rng) % ARCHIVE;
     }
     lock_shared();
@@ -330,6 +343,9 @@ void finish_episode(Rubiks* env, int solved) {
             REPLAY_PERF = (float)REPLAYS_SOLVED / BATCH;
             REPLAY_LENGTH = (float)REPLAY_MOVES
                 / (REPLAYS_SOLVED > 0 ? REPLAYS_SOLVED : 1);
+            NUDGE += REPLAY_PERF > env->nudge_target ? NUDGE_STEP
+                : -NUDGE_STEP;
+            NUDGE = fminf(fmaxf(NUDGE, 0), env->nudge_max);
             REPLAYS = 0;
             REPLAYS_SOLVED = 0;
             REPLAY_MOVES = 0;
@@ -342,13 +358,14 @@ void finish_episode(Rubiks* env, int solved) {
         env->log.perf += solved;
         env->log.score += solved;
         env->log.episode_length += env->tick;
-        // The next three are logged as they stand by every episode, so that
+        // The next four are logged as they stand by every episode, so that
         // the mean the dashboard takes over episodes comes out as the value
         // itself. Until there is a solve the record reads as the move limit.
         env->log.shortest_solve += SHORTEST_SOLVE ? SHORTEST_SOLVE
             : env->max_steps;
         env->log.replay_perf += REPLAY_PERF;
         env->log.replay_length += REPLAY_LENGTH;
+        env->log.nudge += NUDGE;
         env->log.n++;
     }
     unlock_shared();
@@ -531,6 +548,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "replay_perf", log->replay_perf);
     dict_set(out, "replay_length", log->replay_length);
+    dict_set(out, "nudge", log->nudge);
     dict_set(out, "n", log->n);
 }
 
@@ -542,6 +560,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->archive_share = dict_get(kwargs, "archive_share");
     env->archive_keep = dict_get(kwargs, "archive_keep");
     env->nudge = dict_get(kwargs, "nudge");
+    env->nudge_target = dict_get(kwargs, "nudge_target");
+    env->nudge_max = dict_get(kwargs, "nudge_max");
     // The pool starts as the solved cube. Every env comes through here, so it
     // is only put in once.
     lock_shared();
@@ -550,6 +570,7 @@ void puf_init(Env* env, Dict* kwargs) {
             POOL_CUBES[0][j] = j / 9;
         }
         POOLED = 1;
+        NUDGE = env->nudge;
     }
     unlock_shared();
     // The trainer starts each env's generator at its index, so every run
